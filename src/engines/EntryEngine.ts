@@ -103,6 +103,19 @@ export function processEntry(input: EntryEngineInput): EntryEngineOutput {
     // LIMIT_RETRACE: Fill only if price retraces to entry level
     // ═══════════════════════════════════════════════════════════════════════════
     if (entryType === 'LIMIT_RETRACE') {
+        // 🔴 ANTI-LOOKAHEAD FIX: Cannot fill on the same bar the signal was generated
+        // The signal is generated at the CLOSE of decisionBar. Checking decisionBar's High/Low
+        // for a fill implies we travelled back in time to catch a price that occurred before the close.
+        if (currentBarIndex <= signal.decisionBar) {
+            return {
+                filled: false,
+                fillPrice: 0,
+                fillBar: 0,
+                status: 'PENDING',
+                costR: 0
+            };
+        }
+
         // Check if bar touches entry level
         if (canFillLimitOrder(currentBar, targetEntry, direction)) {
             // Limit order fills at exact entry price (no slippage for limits)
