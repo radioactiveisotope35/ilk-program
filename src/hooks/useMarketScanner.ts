@@ -1133,9 +1133,32 @@ export const useMarketScanner = (
             if (signals.length > 0) {
               console.log(`[STARTUP-ANALYSIS] ${asset.symbol} ${tf}: ${signals.length} signals found!`);
 
+              // Timeframe duration in ms for staleness check
+              const getTfDurationMs = (t: string): number => {
+                const map: Record<string, number> = {
+                  '1m': 60 * 1000, '5m': 5 * 60 * 1000, '15m': 15 * 60 * 1000,
+                  '30m': 30 * 60 * 1000, '1h': 60 * 60 * 1000, '4h': 4 * 60 * 60 * 1000, '1d': 24 * 60 * 60 * 1000
+                };
+                return map[t] || 60 * 60 * 1000;
+              };
+              const tfDuration = getTfDurationMs(tf);
+              const STALE_THRESHOLD = 5 * 60 * 1000; // 5 minutes tolerance
+
               for (const signal of signals) {
                 if (!signal || signal.entry <= 0) continue;
                 if (!signal.score || signal.score < 8) continue;
+
+                // FILTER: Skip stale signals
+                // signal.timestamp is Candle Open Time.
+                // Candle Close Time = Open + Duration.
+                // We want to skip if (Now - CloseTime) > Threshold.
+                const candleCloseTime = signal.timestamp + tfDuration;
+                const timeSinceClose = Date.now() - candleCloseTime;
+
+                if (timeSinceClose > STALE_THRESHOLD) {
+                  console.log(`[STARTUP-ANALYSIS] Skipped stale signal: ${signal.symbol} ${tf} (${(timeSinceClose / 60000).toFixed(1)}m old)`);
+                  continue;
+                }
 
                 // Add directly to persistent ref (skip TradePipeline for startup signals)
                 const extendedSignal = signal as ExtendedTradeSetup;
