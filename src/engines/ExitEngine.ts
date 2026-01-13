@@ -1,7 +1,7 @@
 /**
- * ExitEngine - Professional Scalper V5
- * Unified exit logic with TP1 + Runner state machine
- * 
+ * ExitEngine - Professional Scalper V6
+ * Unified exit logic with Tiered (Ratchet) Breakeven
+ *
  * NON-NEGOTIABLE:
  * - TP1 does NOT complete trade (only partial close)
  * - Trade completes on: Runner TP/SL, Soft-stop, Stagnation
@@ -96,6 +96,7 @@ export function processExit(input: ExitEngineInput): ExitEngineOutput {
     const entry = trade.entryPrice;
     const initialSL = trade.signal.stopLoss;
     const finalTP = trade.signal.takeProfit;
+    const risk = Math.abs(entry - initialSL);
 
     // Clone trade state for updates
     const updatedTrade: TradeState = { ...trade };
@@ -202,11 +203,34 @@ export function processExit(input: ExitEngineInput): ExitEngineOutput {
             }
         }
 
+        // TIERED RATCHET LOGIC (Before TP1)
+        // 0.5R Profit -> Reduce risk by 75% (Move SL closer)
+        // 1.0R Profit -> Breakeven (Risk-Free)
+
+        // Check for 0.5R Gain (Reduce Risk)
+        if (currentR >= 0.5 && !updatedTrade.beActive) {
+             // Move SL to 25% of original risk (Reduce risk by 75%)
+             // SL = Entry +/- (0.25 * Risk)
+             const reducedRiskSL = direction === 'LONG'
+                ? entry - (risk * 0.25)
+                : entry + (risk * 0.25);
+
+            // Only move if better than current SL
+            const isBetter = direction === 'LONG'
+                ? reducedRiskSL > updatedTrade.currentSL
+                : reducedRiskSL < updatedTrade.currentSL;
+
+            if (isBetter) {
+                updatedTrade.currentSL = reducedRiskSL;
+            }
+        }
+
         // Check BE trigger (move SL to entry before TP1)
-        if (!updatedTrade.beActive && currentR >= exitParams.BE_TRIGGER_R) {
+        // Usually 1.0R is BE trigger in this tiered system
+        if (currentR >= 1.0 && !updatedTrade.beActive) {
             const beSL = direction === 'LONG'
-                ? entry + (Math.abs(entry - initialSL) * exitParams.BE_SL_R)
-                : entry - (Math.abs(entry - initialSL) * exitParams.BE_SL_R);
+                ? entry + (risk * exitParams.BE_SL_R)
+                : entry - (risk * exitParams.BE_SL_R);
             updatedTrade.currentSL = beSL;
             updatedTrade.beActive = true;
         }
@@ -298,9 +322,52 @@ export function processExit(input: ExitEngineInput): ExitEngineOutput {
             };
         }
 
-        // Trailing stop update
-        if (exitParams.TRAILING_ENABLED && exitParams.TRAILING_STEP_R && exitParams.TRAILING_MOVE_R) {
-            const trailingTriggerR = (updatedTrade.trailingSL ? updatedTrade.maxFavorableR : exitParams.BE_TRIGGER_R) + exitParams.TRAILING_STEP_R;
+        // TIERED RATCHET LOGIC (Runner Phase)
+        // 1.5R Profit -> Lock 0.6R
+        // 2.0R Profit -> Lock 1.0R
+
+        let newRatchetSL = 0;
+        let ratchetLevel = 0;
+
+        if (currentR >= 2.0) {
+            // Level 4: Lock 1.0R
+            newRatchetSL = direction === 'LONG'
+                ? entry + (risk * 1.0)
+                : entry - (risk * 1.0);
+            ratchetLevel = 2.0;
+        } else if (currentR >= 1.5) {
+            // Level 3: Lock 0.6R
+            newRatchetSL = direction === 'LONG'
+                ? entry + (risk * 0.6)
+                : entry - (risk * 0.6);
+            ratchetLevel = 1.5;
+        }
+
+        if (ratchetLevel > 0) {
+            const isBetter = direction === 'LONG'
+                ? newRatchetSL > updatedTrade.currentSL
+                : newRatchetSL < updatedTrade.currentSL;
+
+            if (isBetter) {
+                updatedTrade.currentSL = newRatchetSL;
+                // If trailing SL property exists, update it too
+                if (updatedTrade.trailingSL) {
+                     // Keep trailing SL if it's even better, otherwise use ratchet
+                     const isTrailingBetter = direction === 'LONG'
+                        ? updatedTrade.trailingSL > newRatchetSL
+                        : updatedTrade.trailingSL < newRatchetSL;
+                     if (!isTrailingBetter) {
+                         updatedTrade.trailingSL = newRatchetSL;
+                     }
+                } else {
+                    updatedTrade.trailingSL = newRatchetSL;
+                }
+            }
+        }
+
+        // Fallback to Linear Trailing if enabled (for gains beyond 2.0R)
+        if (exitParams.TRAILING_ENABLED && exitParams.TRAILING_STEP_R && exitParams.TRAILING_MOVE_R && currentR > 2.0) {
+            const trailingTriggerR = (updatedTrade.trailingSL ? updatedTrade.maxFavorableR : 2.0) + exitParams.TRAILING_STEP_R;
 
             if (currentR >= trailingTriggerR) {
                 const newTrailingSL = direction === 'LONG'
@@ -624,4 +691,3 @@ export function stepOnClose(
         exitParams
     });
 }
-

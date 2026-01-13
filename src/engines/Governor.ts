@@ -1,17 +1,20 @@
 /**
  * Governor - Professional Scalper V6
  * Trade Frequency Management with TF Category Isolation
- * 
+ *
  * Features:
  * - Symbol+TF rolling 24h trade counter
  * - CATEGORY-ISOLATED daily budgets (SCALP/INTRADAY/SWING)
  * - Dynamic score adjustment based on targets
- * 
+ * - Tilt Protection (Consecutive Loss Block)
+ * - Correlation Risk Management
+ *
  * V6 Change: Category isolation prevents scalp trades from blocking swing opportunities
  */
 
 import { TimeFrame } from '../types';
-import { GovernorState, GovernorConfig } from './types';
+import { GovernorState, GovernorConfig, Direction } from './types';
+import { MULTI_ASSET_CORRELATION } from '../config/tradeConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TF CATEGORY SYSTEM - Professional Desk Isolation
@@ -69,7 +72,7 @@ export const DEFAULT_GOVERNOR_CONFIG: GovernorConfig = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MODULE STATE (Extended for Category Tracking)
+// MODULE STATE (Extended for Category Tracking & Risk)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 interface ExtendedGovernorState extends GovernorState {
@@ -82,6 +85,17 @@ let governorState: ExtendedGovernorState = {
     globalDailyStart: getStartOfDay(),
     categoryDailyCounts: { SCALP: 0, INTRADAY: 0, SWING: 0 }
 };
+
+// Tilt Protection State
+interface LossTracker {
+    count: number;
+    blockedUntil: number;
+    lastLossTime: number;
+}
+const LOSS_TRACKER: Record<string, LossTracker> = {};
+
+// Correlation Risk State
+const ACTIVE_CORRELATION_SIGNALS = new Map<string, { symbol: string; direction: Direction }[]>();
 
 function getStartOfDay(): number {
     const now = new Date();
@@ -238,6 +252,148 @@ export function isInBarCooldown(
     return (currentBar - lastTradeBar) < cooldownBars;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TILT PROTECTION (Risk Layer)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if symbol is blocked due to consecutive losses (Tilt Protection)
+ */
+export function checkTiltBlock(symbol: string): boolean {
+    const tracker = LOSS_TRACKER[symbol];
+    if (!tracker) return false;
+
+    // Check if block has expired
+    if (tracker.blockedUntil > 0 && Date.now() > tracker.blockedUntil) {
+        // Reset after block expiry
+        tracker.count = 0;
+        tracker.blockedUntil = 0;
+        return false;
+    }
+
+    return tracker.blockedUntil > Date.now();
+}
+
+/**
+ * Register a loss for a symbol (Tilt Protection)
+ */
+export function registerLoss(symbol: string, timeframe?: string): void {
+    const now = Date.now();
+    const oneHourMs = 60 * 60 * 1000;
+    // HYBRID: Scalper-friendly cooldown (1m/5m: 10dk, diğerleri: 30dk)
+    const isScalp = timeframe === '1m' || timeframe === '5m';
+    const cooldownMs = isScalp ? 10 * 60 * 1000 : 30 * 60 * 1000;
+
+    if (!LOSS_TRACKER[symbol]) {
+        LOSS_TRACKER[symbol] = { count: 1, blockedUntil: 0, lastLossTime: now };
+        return;
+    }
+
+    const tracker = LOSS_TRACKER[symbol];
+
+    // Reset if last loss was > 1 hour ago
+    if (now - tracker.lastLossTime > oneHourMs) {
+        tracker.count = 1;
+        tracker.lastLossTime = now;
+        return;
+    }
+
+    // Increment loss count
+    tracker.count++;
+    tracker.lastLossTime = now;
+
+    // PINPON: Scalp tolerance higher (5 losses), others 3
+    const lossThreshold = isScalp ? 5 : 3;
+    if (tracker.count >= lossThreshold) {
+        tracker.blockedUntil = now + cooldownMs;
+        tracker.count = 0; // Reset count but keep blocked
+        console.log(`[GOVERNOR] 🚫 TILT BLOCK: ${symbol} blocked for ${cooldownMs/60000}m (Threshold: ${lossThreshold})`);
+    }
+}
+
+/**
+ * Reset loss tracker (e.g. for backtests)
+ */
+export function resetLossTracker(): void {
+    for (const key in LOSS_TRACKER) {
+        delete LOSS_TRACKER[key];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORRELATION RISK MANAGEMENT (Risk Layer)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check if a trade is allowed based on correlation limits
+ */
+export function checkCorrelationLimit(
+    symbol: string,
+    direction: Direction
+): { blocked: boolean; reason: string } {
+    if (!MULTI_ASSET_CORRELATION.ENABLED) return { blocked: false, reason: '' };
+
+    // Find which group this symbol belongs to
+    let groupIndex = -1;
+    for (let i = 0; i < MULTI_ASSET_CORRELATION.CORRELATION_GROUPS.length; i++) {
+        if (MULTI_ASSET_CORRELATION.CORRELATION_GROUPS[i].includes(symbol)) {
+            groupIndex = i;
+            break;
+        }
+    }
+
+    if (groupIndex === -1) return { blocked: false, reason: '' };
+
+    const groupKey = `group_${groupIndex}`;
+    const groupSignals = ACTIVE_CORRELATION_SIGNALS.get(groupKey) || [];
+
+    // Count signals in same direction
+    const sameDirectionCount = groupSignals.filter(s => s.direction === direction).length;
+
+    if (sameDirectionCount >= MULTI_ASSET_CORRELATION.MAX_SAME_DIRECTION_PER_GROUP) {
+        return {
+            blocked: true,
+            reason: `CORRELATION_LIMIT (${sameDirectionCount} ${direction} in group)`
+        };
+    }
+
+    return { blocked: false, reason: '' };
+}
+
+/**
+ * Record a trade for correlation tracking
+ */
+export function recordCorrelationTrade(symbol: string, direction: Direction): void {
+    for (let i = 0; i < MULTI_ASSET_CORRELATION.CORRELATION_GROUPS.length; i++) {
+        if (MULTI_ASSET_CORRELATION.CORRELATION_GROUPS[i].includes(symbol)) {
+            const groupKey = `group_${i}`;
+            const groupSignals = ACTIVE_CORRELATION_SIGNALS.get(groupKey) || [];
+            groupSignals.push({ symbol, direction });
+            ACTIVE_CORRELATION_SIGNALS.set(groupKey, groupSignals);
+            break;
+        }
+    }
+}
+
+/**
+ * Remove a trade from correlation tracking (on close)
+ */
+export function removeCorrelationTrade(symbol: string): void {
+    for (let i = 0; i < MULTI_ASSET_CORRELATION.CORRELATION_GROUPS.length; i++) {
+        if (MULTI_ASSET_CORRELATION.CORRELATION_GROUPS[i].includes(symbol)) {
+            const groupKey = `group_${i}`;
+            const groupSignals = ACTIVE_CORRELATION_SIGNALS.get(groupKey) || [];
+            const filtered = groupSignals.filter(s => s.symbol !== symbol);
+            ACTIVE_CORRELATION_SIGNALS.set(groupKey, filtered);
+            break;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /**
  * Get governor status for display (V6: includes category info)
  */
@@ -254,6 +410,7 @@ export function getGovernorStatus(
     targetRange: { min: number; max: number };
     scoreAdjust: number;
     status: 'UNDER' | 'OK' | 'OVER' | 'BLOCKED';
+    tiltBlocked: boolean;
 } {
     checkAndResetDaily();
 
@@ -263,11 +420,12 @@ export function getGovernorStatus(
     const category = getCategoryForTf(tf);
     const categoryCount = governorState.categoryDailyCounts[category];
     const categoryBudget = CATEGORY_BUDGETS[category];
+    const tiltBlocked = checkTiltBlock(symbol);
 
     let status: 'UNDER' | 'OK' | 'OVER' | 'BLOCKED';
 
     // V6: Check CATEGORY budget, not global
-    if (categoryCount >= categoryBudget.max) {
+    if (categoryCount >= categoryBudget.max || tiltBlocked) {
         status = 'BLOCKED';
     } else if (count >= target.max) {
         status = 'OVER';
@@ -285,7 +443,8 @@ export function getGovernorStatus(
         categoryBudget,
         targetRange: target,
         scoreAdjust,
-        status
+        status,
+        tiltBlocked
     };
 }
 
@@ -299,5 +458,7 @@ export function resetGovernorState(): void {
         globalDailyStart: getStartOfDay(),
         categoryDailyCounts: { SCALP: 0, INTRADAY: 0, SWING: 0 }
     };
+    resetLossTracker();
+    ACTIVE_CORRELATION_SIGNALS.clear();
     console.log('[GOVERNOR] State reset');
 }

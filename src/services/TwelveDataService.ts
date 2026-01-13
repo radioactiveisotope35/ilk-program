@@ -1,14 +1,14 @@
 /**
  * TwelveDataService - Forex Real-Time Data Provider
- * 
+ *
  * Connects to Twelve Data WebSocket for real-time Forex quotes.
  * Builds candles locally from tick data to avoid API credit consumption.
- * 
+ *
  * FREE TIER LIMITS:
  * - 800 API Credits/Day (REST)
  * - 8 WebSocket Symbols Concurrent
  * - 8 API Calls/Minute
- * 
+ *
  * STRATEGY: Use WebSocket for everything, REST only for initial history.
  */
 
@@ -271,14 +271,33 @@ const disconnect = () => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// REST API: INITIAL HISTORY FETCH (Uses Credits!)
+// REST API: GAPLESS HISTORY FETCH (Recursive)
 // ═══════════════════════════════════════════════════════════════════════════════
-export const fetchForexHistory = async (
+
+/**
+ * Fetch historical data ensuring the requested number of candles are retrieved.
+ * If the API returns fewer than requested (due to limits), recursively fetch older data.
+ *
+ * @param symbol Symbol (e.g. 'EUR/USD')
+ * @param timeframe TimeFrame
+ * @param limit Total number of candles required
+ * @param endDate Optional end date for pagination (YYYY-MM-DD HH:mm:ss)
+ * @returns Array of candles sorted old -> new
+ */
+export const fetchGaplessHistory = async (
     symbol: string,
     timeframe: TimeFrame,
-    limit: number = 200
+    limit: number = 500,
+    endDate?: string
 ): Promise<any[]> => {
-    // Convert timeframe to Twelve Data interval format
+    // Check existing count first to avoid unnecessary API calls
+    const existingCount = getCandleCount(symbol, timeframe);
+    if (existingCount >= limit && !endDate) {
+        console.log(`[TWELVE-DATA] Gapless: ${symbol} ${timeframe} already has ${existingCount} candles`);
+        return getCandles(symbol, timeframe, limit, true);
+    }
+
+    // Interval mapping
     const intervalMap: Record<TimeFrame, string> = {
         '1m': '1min',
         '5m': '5min',
@@ -289,60 +308,105 @@ export const fetchForexHistory = async (
         '1d': '1day'
     };
     const interval = intervalMap[timeframe];
+    const maxPerRequest = 5000; // Twelve Data max outputsize (Free tier might be lower, e.g. 5000)
 
-    // Check if we already have enough data in CandleStore
-    const existingCount = getCandleCount(symbol, timeframe);
-    if (existingCount >= limit) {
-        console.log(`[TWELVE-DATA] History: ${symbol} ${timeframe} already has ${existingCount} candles`);
-        return getCandles(symbol, timeframe, limit, true);
-    }
+    // We will fetch in chunks if limit > maxPerRequest, but usually free tier limit is generous enough per call
+    // However, if we need to paginate backwards:
 
-    const url = `${TWELVE_DATA_REST_URL}/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${limit}&apikey=${TWELVE_DATA_API_KEY}`;
+    let allCandles: any[] = [];
+    let remaining = limit;
+    let currentEndDate = endDate;
 
-    try {
-        console.log(`[TWELVE-DATA] Fetching history: ${symbol} ${timeframe} (${limit} bars)`);
-        const response = await fetch(url);
-        const data = await response.json();
+    while (remaining > 0) {
+        const fetchSize = Math.min(remaining, maxPerRequest);
+        let url = `${TWELVE_DATA_REST_URL}/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${fetchSize}&apikey=${TWELVE_DATA_API_KEY}`;
 
-        if (data.status === 'error') {
-            console.error('[TWELVE-DATA] API Error:', data.message);
-            telemetry.errors.push(data.message);
-            return [];
+        if (currentEndDate) {
+            url += `&end_date=${encodeURIComponent(currentEndDate)}`;
         }
 
-        telemetry.apiCreditsUsed++;  // Each REST call = 1 credit
+        try {
+            console.log(`[TWELVE-DATA] Fetching gapless: ${symbol} ${timeframe} (Need ${remaining}, requesting ${fetchSize})`);
+            const response = await fetch(url);
+            const data = await response.json();
 
-        if (!data.values || !Array.isArray(data.values)) {
-            console.warn('[TWELVE-DATA] No values in response');
-            return [];
+            telemetry.apiCreditsUsed++;
+
+            if (data.status === 'error') {
+                console.error('[TWELVE-DATA] API Error:', data.message);
+                telemetry.errors.push(data.message);
+                break; // Stop fetching on error
+            }
+
+            if (!data.values || !Array.isArray(data.values) || data.values.length === 0) {
+                console.warn('[TWELVE-DATA] No more data available');
+                break;
+            }
+
+            // Twelve Data returns newest first.
+            const newCandles = data.values.map((v: any) => {
+                const timestamp = new Date(v.datetime).getTime();
+                const close = parseFloat(v.close);
+                return {
+                    timestamp,
+                    time: v.datetime,
+                    open: parseFloat(v.open),
+                    high: parseFloat(v.high),
+                    low: parseFloat(v.low),
+                    close,
+                    price: close,
+                    volume: parseFloat(v.volume) || 0,
+                    closed: true // Historical candles are closed
+                };
+            });
+
+            // Add to collection (since API returns newest first, these are older than what we might have fetched in previous loop)
+            // But we want to construct the full array.
+            // If we are paging backwards:
+            // Loop 1: EndDate=Now. Returns [T-1...T-500].
+            // Loop 2: EndDate=T-500. Returns [T-501...T-1000].
+            // We append to allCandles.
+
+            allCandles = [...allCandles, ...newCandles];
+            remaining -= newCandles.length;
+
+            // Prepare for next iteration
+            // Use the timestamp of the oldest candle retrieved as the new end_date
+            const oldestCandle = newCandles[newCandles.length - 1];
+            currentEndDate = oldestCandle.time; // Use the formatted string from API
+
+            // Safety break if API returns fewer than requested (end of data)
+            if (newCandles.length < fetchSize) {
+                console.log('[TWELVE-DATA] Reached end of historical data');
+                break;
+            }
+
+        } catch (err) {
+            console.error('[TWELVE-DATA] Fetch error:', err);
+            telemetry.errors.push(`Fetch error: ${err}`);
+            break;
         }
-
-        // Convert Twelve Data format to our format (matches StoredCandle interface)
-        const candles = data.values.map((v: any) => {
-            const timestamp = new Date(v.datetime).getTime();
-            const close = parseFloat(v.close);
-            return {
-                timestamp,
-                time: v.datetime,
-                open: parseFloat(v.open),
-                high: parseFloat(v.high),
-                low: parseFloat(v.low),
-                close,
-                price: close,
-                volume: parseFloat(v.volume) || 0
-            };
-        }).reverse();  // Twelve Data returns newest first, we want oldest first
-
-        // Seed CandleStore
-        seedCandles(symbol, timeframe, candles, false);
-        console.log(`[TWELVE-DATA] Seeded ${candles.length} candles for ${symbol} ${timeframe}`);
-
-        return candles;
-    } catch (err) {
-        console.error('[TWELVE-DATA] Fetch error:', err);
-        telemetry.errors.push(`Fetch error: ${err}`);
-        return [];
     }
+
+    // Sort allCandles by timestamp ascending (Old -> New) for the store
+    const sortedCandles = allCandles.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Seed CandleStore
+    seedCandles(symbol, timeframe, sortedCandles, false); // merge=false to ensure gapless override? Or true?
+    // Actually, seedCandles with replace=false merges. If we want to guarantee gapless, we might want to ensure we have the contiguous block.
+    // But seedCandles handles merging.
+
+    console.log(`[TWELVE-DATA] Gapless complete: ${symbol} ${timeframe} - Loaded ${sortedCandles.length} candles`);
+    return sortedCandles;
+};
+
+// Legacy wrapper for compatibility
+export const fetchForexHistory = async (
+    symbol: string,
+    timeframe: TimeFrame,
+    limit: number = 200
+): Promise<any[]> => {
+    return fetchGaplessHistory(symbol, timeframe, limit);
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

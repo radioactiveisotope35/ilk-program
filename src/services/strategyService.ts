@@ -22,64 +22,13 @@ import { SYMBOL_MAP } from './mockMarket';
 // ─── NEW TYPES FOR RISK ENGINE ───
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL TILT PROTECTION - Seri kayıp koruması
-// Kural: 1 saat içinde 3 ardışık kayıp → 4 saat blok
+// GLOBAL TILT PROTECTION - Managed by Governor
 // ═══════════════════════════════════════════════════════════════════════════════
-let LOSS_TRACKER: Record<string, { count: number; blockedUntil: number; lastLossTime: number }> = {};
-
-/**
- * Reset loss tracker - Backtest başlarken çağrılır
- */
-export const resetLossTracker = (): void => {
-  LOSS_TRACKER = {};
-};
-
-/**
- * Sembolün tilt nedeniyle bloklu olup olmadığını kontrol et
- */
-const checkTiltBlock = (symbol: string): boolean => {
-  const tracker = LOSS_TRACKER[symbol];
-  if (!tracker) return false;
-  return tracker.blockedUntil > Date.now();
-};
-
-/**
- * Kayıp kaydet - Tilt takibi için
- * HYBRID STRATEGY: Scalper-dostu esnek ceza süreleri
- * 1m/5m: 10 dakika, diğerleri: 30 dakika
- */
-export const registerLoss = (symbol: string, timeframe?: string): void => {
-  const now = Date.now();
-  const oneHourMs = 60 * 60 * 1000;
-  // HYBRID: Scalper-friendly cooldown (1m/5m: 10dk, diğerleri: 30dk)
-  const isScalp = timeframe === '1m' || timeframe === '5m';
-  const cooldownMs = isScalp ? 10 * 60 * 1000 : 30 * 60 * 1000;
-
-  if (!LOSS_TRACKER[symbol]) {
-    LOSS_TRACKER[symbol] = { count: 1, blockedUntil: 0, lastLossTime: now };
-    return;
-  }
-
-  const tracker = LOSS_TRACKER[symbol];
-
-  // Son kayıp 1 saatten eskiyse sayacı sıfırla
-  if (now - tracker.lastLossTime > oneHourMs) {
-    tracker.count = 1;
-    tracker.lastLossTime = now;
-    return;
-  }
-
-  // Kayıp sayısını artır
-  tracker.count++;
-  tracker.lastLossTime = now;
-
-  // PINPON: Scalp'te tolerans yüksek (5 kayıp), diğerlerinde 3
-  const lossThreshold = isScalp ? 5 : 3;
-  if (tracker.count >= lossThreshold) {
-    tracker.blockedUntil = now + cooldownMs;
-    tracker.count = 0;
-  }
-};
+import {
+  checkTiltBlock,
+  registerLoss,
+  resetLossTracker
+} from '../engines/Governor';
 
 export type TradeMode = 'TREND' | 'SCALP' | 'REVERSAL';
 export type TrendRegime = 'STRONG_UP' | 'STRONG_DOWN' | 'RANGE' | 'NEUTRAL';
@@ -829,74 +778,11 @@ const getVolatilityRegime = (history: Candle[], atr: number): {
 };
 
 // --- CORRELATION GROUP CHECK ---
-// Track active signals per correlation group
-const activeCorrelationSignals = new Map<string, { symbol: string; direction: 'LONG' | 'SHORT' }[]>();
-
-/**
- * Check if we already have too many signals in same direction for correlated assets
- */
-const checkCorrelationLimit = (
-  symbol: string,
-  direction: 'LONG' | 'SHORT'
-): { blocked: boolean; reason: string } => {
-  if (!MULTI_ASSET_CORRELATION.ENABLED) return { blocked: false, reason: '' };
-
-  // Find which group this symbol belongs to
-  let groupIndex = -1;
-  for (let i = 0; i < MULTI_ASSET_CORRELATION.CORRELATION_GROUPS.length; i++) {
-    if (MULTI_ASSET_CORRELATION.CORRELATION_GROUPS[i].includes(symbol)) {
-      groupIndex = i;
-      break;
-    }
-  }
-
-  if (groupIndex === -1) return { blocked: false, reason: '' };
-
-  const groupKey = `group_${groupIndex}`;
-  const groupSignals = activeCorrelationSignals.get(groupKey) || [];
-
-  // Count signals in same direction
-  const sameDirectionCount = groupSignals.filter(s => s.direction === direction).length;
-
-  if (sameDirectionCount >= MULTI_ASSET_CORRELATION.MAX_SAME_DIRECTION_PER_GROUP) {
-    return {
-      blocked: true,
-      reason: `CORRELATION_LIMIT (${sameDirectionCount} ${direction} in group)`
-    };
-  }
-
-  return { blocked: false, reason: '' };
-};
-
-/**
- * Add signal to correlation tracking
- */
-export const addToCorrelationTracking = (symbol: string, direction: 'LONG' | 'SHORT'): void => {
-  for (let i = 0; i < MULTI_ASSET_CORRELATION.CORRELATION_GROUPS.length; i++) {
-    if (MULTI_ASSET_CORRELATION.CORRELATION_GROUPS[i].includes(symbol)) {
-      const groupKey = `group_${i}`;
-      const groupSignals = activeCorrelationSignals.get(groupKey) || [];
-      groupSignals.push({ symbol, direction });
-      activeCorrelationSignals.set(groupKey, groupSignals);
-      break;
-    }
-  }
-};
-
-/**
- * Remove signal from correlation tracking
- */
-export const removeFromCorrelationTracking = (symbol: string): void => {
-  for (let i = 0; i < MULTI_ASSET_CORRELATION.CORRELATION_GROUPS.length; i++) {
-    if (MULTI_ASSET_CORRELATION.CORRELATION_GROUPS[i].includes(symbol)) {
-      const groupKey = `group_${i}`;
-      const groupSignals = activeCorrelationSignals.get(groupKey) || [];
-      const filtered = groupSignals.filter(s => s.symbol !== symbol);
-      activeCorrelationSignals.set(groupKey, filtered);
-      break;
-    }
-  }
-};
+import {
+  checkCorrelationLimit,
+  recordCorrelationTrade as addToCorrelationTracking,
+  removeCorrelationTrade as removeFromCorrelationTracking
+} from '../engines/Governor';
 
 /**
  * MASTER FILTER CHECK - combines all V4.5.0 filters
@@ -990,14 +876,10 @@ export const getFilterStatus = (): FilterStatus[] => {
   });
 
   // 4. Correlation Limit
-  let totalCorrelationSignals = 0;
-  activeCorrelationSignals.forEach(signals => {
-    totalCorrelationSignals += signals.length;
-  });
   filters.push({
     name: 'Correlation Limit',
     status: MULTI_ASSET_CORRELATION.ENABLED ? 'ACTIVE' : 'INACTIVE',
-    detail: `${totalCorrelationSignals} active in groups`,
+    detail: 'Managed by Governor',
     icon: 'correlation'
   });
 
