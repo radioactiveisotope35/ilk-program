@@ -1,7 +1,7 @@
 /**
- * TradePipeline - Professional Scalper V5
+ * TradePipeline - Professional Scalper V6
  * Unified pipeline for backtest and live monitor parity
- * 
+ *
  * CLOSE-ONLY: All decisions use lastClosedCandle only
  * SINGLE ENGINE: SignalEngine → EntryEngine → ExitEngine → CostModel → Governor
  */
@@ -18,7 +18,14 @@ import {
 import { processExit, createTradeState } from './ExitEngine';
 import { processEntry, determineEntryType } from './EntryEngine';
 import { estimateCostR, calculateCosts, DEFAULT_FEE_BPS, DEFAULT_SLIPPAGE_BPS } from './CostModel';
-import { getScoreAdjustment, recordTrade, isCategoryBudgetExhausted } from './Governor';
+import {
+    getScoreAdjustment,
+    recordTrade,
+    isCategoryBudgetExhausted,
+    recordCorrelationTrade,
+    removeCorrelationTrade,
+    registerLoss
+} from './Governor';
 import { getExitParams } from '../config/tradeConfig';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -69,6 +76,39 @@ export function cleanupLastProcessedTs(): void {
             lastProcessedTs.delete(key);
         }
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DYNAMIC POSITION SIZING HELPER (Layer 4A)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Mock Account Balance (since no exchange connection)
+const MOCK_ACCOUNT_BALANCE = 10000; // $10,000 Paper Trading
+const RISK_PER_TRADE = 0.01;        // 1.0% Risk
+
+/**
+ * Calculate position size based on risk percentage
+ * Size = (Balance * Risk%) / |Entry - SL|
+ */
+export function calculatePositionSize(
+    entry: number,
+    stopLoss: number,
+    balance: number = MOCK_ACCOUNT_BALANCE,
+    riskPct: number = RISK_PER_TRADE
+): number {
+    const riskAmount = balance * riskPct;
+    const priceDiff = Math.abs(entry - stopLoss);
+
+    if (priceDiff <= 0) return 0;
+
+    // Calculate raw size
+    let size = riskAmount / priceDiff;
+
+    // Sanity check: Max size (e.g. 5x leverage max)
+    const maxSize = (balance * 5) / entry;
+    if (size > maxSize) size = maxSize;
+
+    return size;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -199,6 +239,12 @@ export function runPipeline(input: PipelineInput): PipelineOutput {
                 const totalCostR = costResult.costR;
                 const netR = grossR - totalCostR;
 
+                // V6: Governor State Updates (Risk & Correlation)
+                removeCorrelationTrade(trade.signal.symbol);
+                if (netR < 0) {
+                    registerLoss(trade.signal.symbol, trade.signal.timeframe);
+                }
+
                 const completedTrade = {
                     id: trade.id,
                     symbol: trade.signal.symbol,
@@ -256,12 +302,22 @@ export function runPipeline(input: PipelineInput): PipelineOutput {
             if (entryResult.filled) {
                 // Entry filled, create active trade
                 const newTrade = createTradeState(signal, entryResult.fillPrice, entryResult.fillBar, entryResult.costR);
+
+                // V6: Apply Dynamic Position Sizing (Risk-Based)
+                const positionSize = calculatePositionSize(newTrade.entryPrice, newTrade.signal.stopLoss);
+                newTrade.initialSize = positionSize;
+                newTrade.currentSize = positionSize;
+
                 activeTrades.set(signal.id, newTrade);
                 output.activeTrades.push(newTrade);
                 pendingSignals.delete(signalId);
 
                 // Record trade for Governor at ENTRY (frequency control counts entries)
                 recordTrade(signal.symbol, signal.timeframe);
+
+                // V6: Governor State Update (Correlation)
+                recordCorrelationTrade(signal.symbol, signal.direction);
+
             } else if (entryResult.status === 'EXPIRED') {
                 // TTL expired, remove pending
                 pendingSignals.delete(signalId);
@@ -587,8 +643,11 @@ export function processIntrabarTick(input: TickInput): PipelineDelta {
                         delta.completedTrades.push(completed);
                         delta.logs.push(`[TIMER] FINAL_EXIT ${trade.id}: ${result.exitReason}`);
 
-                        // NOTE: Trade already recorded at ENTRY (line 243), not here
-                        // Recording at exit would cause duplicate counting in Governor
+                        // V6: Governor State Update (Close Correlation & Loss)
+                        removeCorrelationTrade(symbol);
+                        if (result.netPnlR && result.netPnlR < 0) {
+                            registerLoss(symbol, timeframe);
+                        }
                     }
                 } else if (result.trade.tp1Hit && !trade.tp1Hit) {
                     // TP1 hit - phase transition
